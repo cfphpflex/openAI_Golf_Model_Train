@@ -82,6 +82,7 @@ python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
 
 This populates `./data/datasets/fineweb10B_sp1024/` and `./data/tokenizers/`.
 By default this downloads the full validation split plus 80 training shards (8B tokens). For a smaller local smoke subset, pass `--train-shards 1`, for example `python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 1`.
+For quality-focused local tuning, avoid `--train-shards 1`; use a larger shard count (for example `--train-shards 10`) once your smoke run is stable.
 
 Then run a small MLX training job:
 
@@ -95,6 +96,7 @@ python3 train_gpt_mlx.py
 ```
 
 Validation always runs on the full `fineweb_val_*` split, which is the fixed first-50k-document set. The smoke command above skips periodic validation and just prints the final `val_loss` and `val_bpb` once at the end.
+You can also set `QUALITY_MODE=1` in `train_gpt_mlx.py` to use a stronger schedule profile and explicit warnings when train shard count is too small for competitive quality.
 
 ### Scaling Up to a Remote Machine
 
@@ -125,6 +127,7 @@ python3 data/cached_challenge_fineweb.py --variant sp1024
 ```
 
 This defaults to the full validation split plus 80 training shards (8B tokens). If you only want a smaller subset while iterating, pass `--train-shards N`, for example `--train-shards 1`.
+For serious quality runs, use the larger/default shard count and move to CUDA training once local MLX smoke checks pass.
 
 Launch your first training run. Note that we're passing `nproc_per_node=1` because we're running on a single H100 GPU in this case.
 

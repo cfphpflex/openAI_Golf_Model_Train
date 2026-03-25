@@ -47,6 +47,7 @@ class Hyperparameters:
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", 1337))
 
+    quality_mode: bool = bool(int(os.environ.get("QUALITY_MODE", "0")))
     # Training loop. These defaults now mirror train_gpt.py on a single process.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
@@ -64,8 +65,11 @@ class Hyperparameters:
     # Disable on 32GB+ unified memory for better throughput (MLX_EAGER_EVAL=0).
     mlx_eager_eval: bool = bool(int(os.environ.get("MLX_EAGER_EVAL", "1")))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
-    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 3500 if quality_mode else 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    eval_stride: int = int(os.environ.get("EVAL_STRIDE", 64 if quality_mode else 1024))
+    min_train_shards_for_quality: int = int(os.environ.get("MIN_TRAIN_SHARDS_FOR_QUALITY", 10))
+    fail_on_small_train_shards: bool = bool(int(os.environ.get("FAIL_ON_SMALL_TRAIN_SHARDS", "0")))
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -813,6 +817,79 @@ def eval_val(
     val_bpb = bits_per_token * (total_tokens / total_bytes)
     return val_loss, val_bpb
 
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    compiled_loss,
+    val_tokens: np.ndarray,
+    base_bytes_lut: np.ndarray,
+    has_leading_space_lut: np.ndarray,
+    is_boundary_token_lut: np.ndarray,
+    log_fn: Callable[[str], None] | None = None,
+) -> tuple[float, float]:
+    stride = max(1, args.eval_stride)
+    if stride >= args.train_seq_len:
+        return eval_val(
+            args,
+            compiled_loss,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log_fn=log_fn,
+        )
+
+    val_batch_tokens = args.val_batch_size // args.grad_accum_steps
+    if val_batch_tokens < args.train_seq_len:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one sequence; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
+            f"TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    val_batch_seqs = val_batch_tokens // args.train_seq_len
+    total_token_count = val_tokens.size - 1
+    n_windows = 1 + max(0, (total_token_count - args.train_seq_len) // stride)
+    total_batches = max((n_windows + val_batch_seqs - 1) // val_batch_seqs, 1)
+    total_loss_sum = 0.0
+    total_tokens = 0.0
+    total_bytes = 0.0
+
+    for batch_idx, win_start in enumerate(range(0, n_windows, val_batch_seqs), start=1):
+        win_end = min(win_start + val_batch_seqs, n_windows)
+        xs: list[np.ndarray] = []
+        ys: list[np.ndarray] = []
+        for w in range(win_start, win_end):
+            raw_start = w * stride
+            raw_end = raw_start + args.train_seq_len + 1
+            chunk = val_tokens[raw_start:raw_end]
+            if chunk.size < args.train_seq_len + 1:
+                continue
+            xs.append(chunk[:-1])
+            ys.append(chunk[1:])
+        if not xs:
+            continue
+        x_np = np.stack(xs, axis=0)
+        y_np = np.stack(ys, axis=0)
+        x = mx.array(x_np, dtype=mx.int32)
+        y = mx.array(y_np, dtype=mx.int32)
+        chunk_token_count = float(y.size)
+        batch_loss = compiled_loss(x, y).astype(mx.float32)
+        mx.eval(batch_loss)
+        total_loss_sum += float(batch_loss.item()) * chunk_token_count
+        prev_ids = x_np.reshape(-1)
+        tgt_ids = y_np.reshape(-1)
+        bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
+        bytes_np += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).astype(np.int16, copy=False)
+        total_tokens += chunk_token_count
+        total_bytes += float(bytes_np.astype(np.float64).sum())
+        if log_fn is not None and total_batches > 1 and (batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0):
+            log_fn(f"val_progress:{batch_idx}/{total_batches}")
+
+    val_loss = total_loss_sum / total_tokens
+    bits_per_token = val_loss / math.log(2.0)
+    val_bpb = bits_per_token * (total_tokens / total_bytes)
+    return val_loss, val_bpb
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -930,6 +1007,15 @@ def main() -> None:
         )
     else:
         log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}")
+    if args.quality_mode and actual_train_files < args.min_train_shards_for_quality:
+        msg = (
+            f"quality_mode: insufficient train shards for competitive quality "
+            f"({actual_train_files} < {args.min_train_shards_for_quality}). "
+            "Use more shards (recommended >=10, ideally full/default) after smoke tests."
+        )
+        if args.fail_on_small_train_shards:
+            raise ValueError(msg)
+        log(f"WARNING: {msg}")
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
@@ -942,6 +1028,8 @@ def main() -> None:
         f"val_batch_size:{args.val_batch_size} "
         f"warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    eval_mode = f"sliding(stride={args.eval_stride})" if args.eval_stride < args.train_seq_len else "standard(full-window)"
+    log(f"eval_mode:{eval_mode} quality_mode:{args.quality_mode}")
     log(f"mlx_max_microbatch_tokens:{args.mlx_max_microbatch_tokens}")
     log(
         f"optimizer:muon+adam muon_matrix_params:{len(opt.matrix_keys)} scalar_params:{len(opt.scalar_keys)} "
@@ -996,6 +1084,7 @@ def main() -> None:
         train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
 
     train_time_ms = 0.0
+    train_tokens_seen = 0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     stop_after_step: int | None = None
     t0 = time.perf_counter()
@@ -1005,7 +1094,7 @@ def main() -> None:
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             # Validation always scans the same fixed full validation split.
-            val_loss, val_bpb = eval_val(
+            val_loss, val_bpb = eval_val_sliding(
                 args,
                 compiled_loss,
                 val_tokens,
@@ -1023,6 +1112,7 @@ def main() -> None:
         if last_step:
             if stop_after_step is not None and step < args.iterations:
                 log(f"stopping_early: wallclock_cap train_time:{train_time_ms:.0f}ms step:{step}/{args.iterations}")
+            log(f"train_tokens_seen:{train_tokens_seen}")
             break
 
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
@@ -1047,11 +1137,13 @@ def main() -> None:
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
         tok_s = args.train_batch_tokens / (step_ms / 1000.0)
+        train_tokens_seen += args.train_batch_tokens
         step += 1
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
-                f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
+                f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms "
+                f"tok_s:{tok_s:.0f} train_tokens_seen:{train_tokens_seen}"
             )
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
@@ -1086,7 +1178,7 @@ def main() -> None:
     quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
+    q_val_loss, q_val_bpb = eval_val_sliding(
         args,
         compiled_loss,
         val_tokens,

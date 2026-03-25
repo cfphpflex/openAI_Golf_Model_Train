@@ -1,0 +1,25 @@
+---
+description: gstack contributor workflow for Cursor
+globs:
+  - "SKILL.md.tmpl"
+  - "browse/SKILL.md.tmpl"
+  - "**/*.tmpl"
+  - "browse/src/**/*.ts"
+  - "scripts/**/*.ts"
+  - "test/**/*.ts"
+  - "**/SKILL.md"
+alwaysApply: true
+---
+
+- Use Bun commands from the repo root.
+- Default validation flow after edits:
+  1) `bun run gen:skill-docs`
+  2) `bun run skill:check`
+  3) `bun test`
+- Treat `SKILL.md` files as generated artifacts:
+  - edit corresponding `SKILL.md.tmpl` source files
+  - run `bun run gen:skill-docs` after template changes
+  - keep template and regenerated docs in the same commit
+- Prefer `bun run eval:select` before running costed evals.
+- Do not run paid evals (`test:e2e`, `test:evals`) unless explicitly requested.
+- Follow workspace conventions in `CLAUDE.md` and `CONTRIBUTING.md`.

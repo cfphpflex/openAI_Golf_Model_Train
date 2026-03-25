@@ -1,0 +1,11 @@
+---
+description: avoid accidental paid eval runs
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+- `bun run test:e2e`, `bun run test:e2e:all`, `bun run test:evals`, and `bun run test:evals:all` are paid/costed workflows.
+- Before paid evals, run `bun run eval:select` to preview scope.
+- Require explicit user confirmation before running paid evals.
+- Remind that `ANTHROPIC_API_KEY` is required for `test:evals`.
